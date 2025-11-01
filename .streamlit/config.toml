@@ -1,1 +1,15 @@
+[theme]
 
+# Your blue color for buttons, etc.
+primaryColor = "#1e3a8a"
+
+# Main page background (light gray)
+backgroundColor = "#f8f9fa"
+
+# Cards/container background (white)
+secondaryBackgroundColor = "#FFFFFF"
+
+# Main page text (dark gray)
+textColor = "#31333F"
+
+font = "sans serif"

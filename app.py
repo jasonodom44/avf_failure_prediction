@@ -4,6 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 import joblib
+import json  # Import for loading metrics
 from datetime import datetime, timedelta
 
 # Page config
@@ -14,8 +15,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS - Now works WITH the config.toml file
-# Custom CSS - Now works WITH the config.toml file
+# Custom CSS - Works with config.toml
 st.markdown("""
     <style>
     /* --- Sidebar Styling --- */
@@ -68,7 +68,7 @@ st.markdown("""
     }
 
     /* --- Fix for containers (st.metric, etc.) --- */
-    /* THIS IS THE CORRECTED RULE */
+    /* This rule targets ONLY the main page, not the sidebar */
     [data-testid="stMain"] div[data-testid="stVerticalBlock"] > div {
         background-color: white;
         border-radius: 8px;
@@ -90,48 +90,16 @@ def load_data():
     full_data = treatments.merge(patients, on='patient_id')
     full_data = full_data.merge(outcomes[['patient_id', 'failed']], on='patient_id')
 
+    # Combine alarm features - models often use this
+    full_data['total_alarms'] = full_data['high_vp_alarms'] + full_data['low_ap_alarms']
+
     return patients, treatments, outcomes, full_data
 
 
 @st.cache_resource
 def load_model():
+    # Load your trained model
     return joblib.load('models/rf_avf_failure_model.pkl')
-
-
-# More realistic risk score calculation
-def calculate_risk_score(row):
-    risk = row['baseline_risk_score'] * 50  # Start with baseline (0-50%)
-
-    # Add risk from low Qa
-    if row['access_blood_flow_qa'] < 500:
-        risk += 30
-    elif row['access_blood_flow_qa'] < 600:
-        risk += 20
-    elif row['access_blood_flow_qa'] < 700:
-        risk += 10
-
-    # Add risk from high SVPR
-    if row['svpr'] > 1.0:
-        risk += 25
-    elif row['svpr'] > 0.8:
-        risk += 15
-    elif row['svpr'] > 0.6:
-        risk += 10
-
-    # Add risk from recirculation
-    if row['access_recirculation_pct'] > 15:
-        risk += 15
-    elif row['access_recirculation_pct'] > 10:
-        risk += 10
-
-    # Add risk from alarms
-    total_alarms = row['high_vp_alarms'] + row['low_ap_alarms']
-    if total_alarms > 5:
-        risk += 10
-    elif total_alarms > 3:
-        risk += 5
-
-    return min(100, max(0, risk))
 
 
 # Load everything
@@ -139,9 +107,24 @@ try:
     patients, treatments, outcomes, full_data = load_data()
     model = load_model()
     model_loaded = True
-except:
+except Exception as e:
     model_loaded = False
-    st.error("⚠️ Data files not found. Please run data generation first.")
+    st.error(f"⚠️ Error loading data or model: {e}")
+    st.info("Please ensure data/raw/*.csv files and models/rf_avf_failure_model.pkl exist.")
+
+# ---  ACTION REQUIRED ---
+# This list MUST match the features your model was trained on,
+# in the exact same order.
+# I am GUESSING these based on your old code.
+MODEL_FEATURES = [
+    'baseline_risk_score',
+    'access_blood_flow_qa',
+    'svpr',
+    'access_recirculation_pct',
+    'total_alarms'
+]
+# -------------------------
+
 
 # Header with better styling
 st.markdown("""
@@ -155,14 +138,29 @@ st.markdown("""
 st.markdown("---")
 
 if model_loaded:
+    # Check if all required features are present
+    missing_features = [f for f in MODEL_FEATURES if f not in full_data.columns]
+    if missing_features:
+        st.error(f"Error: The data is missing the following required features for the model: {missing_features}")
+        st.stop()  # Don't run the app if features are missing
+
     # Sidebar
     st.sidebar.header("Navigation")
     page = st.sidebar.radio("Select View",
                             ["Clinic Overview", "Patient Detail", "Model Performance"])
 
-    # Calculate current risk scores for high-risk patients
+    # --- NEW RISK CALCULATION (for Clinic Overview) ---
+    # We do this once for the whole app
     latest_treatments = full_data.groupby('patient_id').tail(1).copy()
-    latest_treatments['risk_score'] = latest_treatments.apply(calculate_risk_score, axis=1)
+
+    # Get predictions for all patients
+    X_predict = latest_treatments[MODEL_FEATURES]
+    pred_probabilities = model.predict_proba(X_predict)[:, 1]  # Get prob of 'failure' (class 1)
+
+    # Add new risk score to the dataframe
+    latest_treatments['risk_score'] = pred_probabilities * 100
+
+    # Filter for high-risk patients
     high_risk_patients = latest_treatments[latest_treatments['risk_score'] > 70].sort_values(
         'risk_score', ascending=False
     )
@@ -176,11 +174,11 @@ if model_loaded:
         with col1:
             st.metric("Total Patients", len(patients))
         with col2:
-            st.metric("High Risk Patients",
+            st.metric("High Risk Patients (>70%)",
                       len(high_risk_patients),
                       delta=f"{len(high_risk_patients) / len(patients) * 100:.1f}%")
         with col3:
-            st.metric("Critical Alerts",
+            st.metric("Critical Alerts (>85%)",
                       len(high_risk_patients[high_risk_patients['risk_score'] > 85]))
         with col4:
             avg_risk = latest_treatments['risk_score'].mean()
@@ -190,8 +188,10 @@ if model_loaded:
 
         # High risk patient table
         st.subheader("⚠️ High Risk Patients (Risk > 70%)")
+
         if len(high_risk_patients) > 0:
             def get_top_risk_factor(row):
+                # This heuristic is fine to keep, as it explains the *why*
                 if row['access_blood_flow_qa'] < 600:
                     return "Low Qa (< 600 mL/min)"
                 elif row['svpr'] > 0.8:
@@ -205,13 +205,14 @@ if model_loaded:
 
 
             display_table = high_risk_patients[['patient_id', 'risk_score', 'age',
-                                                'access_blood_flow_qa', 'svpr']].copy()
+                                                'access_blood_flow_qa', 'svpr', 'diabetes']].copy()
             display_table['top_risk_factor'] = high_risk_patients.apply(get_top_risk_factor, axis=1)
             display_table['risk_score'] = display_table['risk_score'].round(1)
-            display_table.columns = ['Patient ID', 'Risk Score (%)', 'Age',
-                                     'Current Qa (mL/min)', 'Current SVPR', 'Top Risk Factor']
 
-            # Removed the extra <style> block here, it's now global
+            # Reorder for clarity
+            display_table = display_table[
+                ['Patient ID', 'Risk Score (%)', 'Top Risk Factor', 'Current Qa (mL/min)', 'Current SVPR', 'Age']]
+
             st.dataframe(display_table.head(15), use_container_width=True, height=400)
         else:
             st.success("✅ No high-risk patients detected")
@@ -222,6 +223,7 @@ if model_loaded:
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Risk Score Distribution")
+            # This graph is now fixed and will show the model's predictions
             fig = px.histogram(
                 latest_treatments,
                 x='risk_score',
@@ -240,6 +242,7 @@ if model_loaded:
                 labels=['<40', '40-50', '50-60', '60-70', '70+']
             )
             age_risk = latest_treatments.groupby('age_group')['risk_score'].mean().reset_index()
+
             fig = px.bar(
                 age_risk,
                 x='age_group',
@@ -256,23 +259,34 @@ if model_loaded:
         patient_list = sorted(patients['patient_id'].unique())
         selected_patient = st.selectbox("Select Patient ID", patient_list)
 
+        # Get patient data
         patient_info = patients[patients['patient_id'] == selected_patient].iloc[0]
         patient_treatments = treatments[treatments['patient_id'] == selected_patient].sort_values('treatment_number')
         patient_outcome = outcomes[outcomes['patient_id'] == selected_patient].iloc[0]
-
         latest = patient_treatments.iloc[-1]
-        temp_row = pd.Series({
-            'baseline_risk_score': patient_info['baseline_risk_score'],
-            'access_blood_flow_qa': latest['access_blood_flow_qa'],
-            'svpr': latest['svpr'],
-            'access_recirculation_pct': latest['access_recirculation_pct'],
-            'high_vp_alarms': latest['high_vp_alarms'],
-            'low_ap_alarms': latest['low_ap_alarms']
-        })
-        current_risk = calculate_risk_score(temp_row)
 
+        # --- NEW RISK CALCULATION (for Patient Detail) ---
+
+        # Create a single-row DataFrame for prediction
+        X_patient = pd.DataFrame({
+            'baseline_risk_score': [patient_info['baseline_risk_score']],
+            'access_blood_flow_qa': [latest['access_blood_flow_qa']],
+            'svpr': [latest['svpr']],
+            'access_recirculation_pct': [latest['access_recirculation_pct']],
+            'total_alarms': [latest['high_vp_alarms'] + latest['low_ap_alarms']]
+        }, index=[0])
+
+        # Re-order columns to match model's expected input
+        X_patient = X_patient[MODEL_FEATURES]
+
+        # Get the prediction
+        patient_prob = model.predict_proba(X_patient)[:, 1]
+        current_risk = patient_prob[0] * 100  # Get the first (and only) prediction
+
+        # Risk score display
         st.markdown("### Current Risk Assessment")
         col1, col2, col3 = st.columns([1, 2, 1])
+
         with col2:
             if current_risk > 85:
                 st.markdown(f'<p class="risk-critical">🔴 CRITICAL: {current_risk:.1f}%</p>',
@@ -293,6 +307,7 @@ if model_loaded:
 
         st.markdown("---")
 
+        # Patient demographics
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Age", f"{patient_info['age']} years")
@@ -306,9 +321,13 @@ if model_loaded:
 
         st.markdown("---")
 
+        # Hemodynamic trends
         st.subheader("📈 Hemodynamic Trends")
+
         col1, col2 = st.columns(2)
+
         with col1:
+            # Qa trend
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=patient_treatments['treatment_number'],
@@ -326,6 +345,7 @@ if model_loaded:
                 height=400
             )
             st.plotly_chart(fig, use_container_width=True)
+
             current_qa = latest['access_blood_flow_qa']
             if current_qa < 600:
                 st.error(f"⚠️ Current Qa: {current_qa:.1f} mL/min (Below threshold)")
@@ -333,6 +353,7 @@ if model_loaded:
                 st.success(f"✅ Current Qa: {current_qa:.1f} mL/min (Normal)")
 
         with col2:
+            # SVPR trend
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=patient_treatments['treatment_number'],
@@ -350,14 +371,17 @@ if model_loaded:
                 height=400
             )
             st.plotly_chart(fig, use_container_width=True)
+
             current_svpr = latest['svpr']
             if current_svpr > 0.5:
                 st.error(f"⚠️ Current SVPR: {current_svpr:.2f} (Above threshold)")
             else:
                 st.success(f"✅ Current SVPR: {current_svpr:.2f} (Normal)")
 
+        # Additional metrics
         st.markdown("---")
         st.subheader("📋 Current Treatment Metrics")
+
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Venous Pressure", f"{latest['venous_pressure_mean']:.1f} mmHg")
@@ -369,6 +393,7 @@ if model_loaded:
             total_alarms = latest['high_vp_alarms'] + latest['low_ap_alarms']
             st.metric("Alarms (Last Treatment)", int(total_alarms))
 
+        # Outcome status
         if patient_outcome['failed'] == 1:
             st.warning(f"⚠️ **Patient outcome:** Failed at treatment #{patient_outcome['failure_treatment_number']}")
         else:
@@ -378,31 +403,50 @@ if model_loaded:
     elif page == "Model Performance":
         st.header("🎯 Model Performance Metrics")
 
-        feature_importance = pd.read_csv('results/feature_importance.csv')
+        # --- NEW: Load metrics from JSON file ---
+        try:
+            with open('results/metrics.json') as f:
+                metrics = json.load(f)
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("AUC-ROC", "0.9000")
-        with col2:
-            st.metric("Recall (Sensitivity)", "88%")
-        with col3:
-            st.metric("Precision", "30%")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("AUC-ROC", f"{metrics.get('auc_roc', 0):.4f}")
+            with col2:
+                st.metric("Recall (Sensitivity)", f"{metrics.get('recall', 0):.1%}")
+            with col3:
+                st.metric("Precision", f"{metrics.get('precision', 0):.1%}")
+
+        except FileNotFoundError:
+            st.error("⚠️ results/metrics.json file not found.")
+            st.info("Please run your model training script to generate this file.")
+        except Exception as e:
+            st.error(f"Error loading metrics file: {e}")
 
         st.markdown("---")
+
+        # Feature importance
         st.subheader("📊 Top 15 Most Important Features")
-        top_features = feature_importance.head(15)
-        fig = px.bar(
-            top_features,
-            x='importance',
-            y='feature',
-            orientation='h',
-            labels={'importance': 'Feature Importance (Gini)', 'feature': 'Feature'},
-            title='Feature Importance Rankings'
-        )
-        fig.update_layout(height=600, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
+        try:
+            feature_importance = pd.read_csv('results/feature_importance.csv')
+            top_features = feature_importance.head(15)
+            fig = px.bar(
+                top_features,
+                x='importance',
+                y='feature',
+                orientation='h',
+                labels={'importance': 'Feature Importance (Gini)', 'feature': 'Feature'},
+                title='Feature Importance Rankings'
+            )
+            fig.update_layout(height=600, yaxis={'categoryorder': 'total ascending'})
+            st.plotly_chart(fig, use_container_width=True)
+        except FileNotFoundError:
+            st.error("⚠️ results/feature_importance.csv file not found.")
+        except Exception as e:
+            st.error(f"Error loading feature importance: {e}")
 
         st.markdown("---")
+
+        # Clinical interpretation
         st.subheader("🔬 Clinical Validation")
         st.markdown("""
         **The model's top predictors align with established medical literature:**
@@ -415,12 +459,13 @@ if model_loaded:
         ✅ **Key Finding:** The model learned actual pathophysiology, not spurious correlations.
         """)
 
+        # Display images if available
         try:
             from PIL import Image
 
             col1, col2 = st.columns(2)
             with col1:
-                st.image('results/figures/roc_curve.png', caption='ROC Curve (AUC = 0.90)')
+                st.image('results/figures/roc_curve.png', caption='ROC Curve')
             with col2:
                 st.image('results/figures/feature_importance.png',
                          caption='Feature Importance Distribution')

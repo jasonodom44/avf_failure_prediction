@@ -79,6 +79,18 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 
+# --- ADD THIS HELPER FUNCTION ---
+def calculate_slope(series):
+    """Calculate linear regression slope"""
+    if len(series) < 2:
+        return 0
+    x = np.arange(len(series))
+    slope = np.polyfit(x, series, 1)[0]
+    return slope
+
+
+# --- END ADD ---
+
 # Load data
 @st.cache_data
 def load_data():
@@ -90,8 +102,51 @@ def load_data():
     full_data = treatments.merge(patients, on='patient_id')
     full_data = full_data.merge(outcomes[['patient_id', 'failed']], on='patient_id')
 
-    # Combine alarm features - models often use this
+    # Combine alarm features - common for models
     full_data['total_alarms'] = full_data['high_vp_alarms'] + full_data['low_ap_alarms']
+
+    # --- ADD ALL FEATURE ENGINEERING FROM NOTEBOOK ---
+    # Sort treatments by patient and treatment number
+    full_data = full_data.sort_values(['patient_id', 'treatment_number'])
+
+    # Calculate rolling averages and trends for key variables
+    rolling_windows = [4, 12]  # Last 4 treatments (~1 week) and last 12 treatments (~1 month)
+
+    for window in rolling_windows:
+        # Rolling mean
+        full_data[f'qa_rolling_mean_{window}'] = full_data.groupby('patient_id')['access_blood_flow_qa'].transform(
+            lambda x: x.rolling(window, min_periods=1).mean()
+        )
+        full_data[f'svpr_rolling_mean_{window}'] = full_data.groupby('patient_id')['svpr'].transform(
+            lambda x: x.rolling(window, min_periods=1).mean()
+        )
+        full_data[f'recirculation_rolling_mean_{window}'] = full_data.groupby('patient_id')[
+            'access_recirculation_pct'].transform(
+            lambda x: x.rolling(window, min_periods=1).mean()
+        )
+        # Rolling std
+        full_data[f'qa_rolling_std_{window}'] = full_data.groupby('patient_id')['access_blood_flow_qa'].transform(
+            lambda x: x.rolling(window, min_periods=1).std().fillna(0)
+        )
+
+    # Calculate change from baseline (first 4 treatments)
+    full_data['qa_baseline'] = full_data.groupby('patient_id')['access_blood_flow_qa'].transform(
+        lambda x: x.head(4).mean()
+    )
+    full_data['qa_change_from_baseline'] = full_data['access_blood_flow_qa'] - full_data['qa_baseline']
+    full_data['qa_pct_change_from_baseline'] = (full_data['qa_change_from_baseline'] / full_data['qa_baseline']) * 100
+
+    # Calculate trend (slope over last 12 treatments)
+    full_data['qa_trend_12'] = full_data.groupby('patient_id')['access_blood_flow_qa'].transform(
+        lambda x: x.rolling(12, min_periods=2).apply(calculate_slope, raw=False).fillna(0)
+    )
+
+    # Encode categorical variables
+    full_data['sex_encoded'] = (full_data['sex'] == 'F').astype(int)
+
+    # Fill any NaNs created by baseline % change (for first few rows)
+    full_data = full_data.fillna(0)
+    # --- END ADD ---
 
     return patients, treatments, outcomes, full_data
 
@@ -115,13 +170,18 @@ except Exception as e:
 # ---  ACTION REQUIRED ---
 # This list MUST match the features your model was trained on,
 # in the exact same order.
-# I am GUESSING these based on your old code.
 MODEL_FEATURES = [
-    'baseline_risk_score',
-    'access_blood_flow_qa',
-    'svpr',
-    'access_recirculation_pct',
-    'total_alarms'
+    'age', 'diabetes', 'hypertension', 'cad', 'pvd',
+    'prior_interventions', 'history_cvc', 'baseline_risk_score',
+    'access_blood_flow_qa', 'venous_pressure_mean', 'svpr',
+    'access_recirculation_pct', 'ktv',
+    'high_vp_alarms', 'low_ap_alarms',
+    'qa_rolling_mean_4', 'qa_rolling_mean_12',
+    'svpr_rolling_mean_4', 'svpr_rolling_mean_12',
+    'recirculation_rolling_mean_4', 'recirculation_rolling_mean_12',
+    'qa_rolling_std_4', 'qa_rolling_std_12',
+    'qa_trend_12', 'qa_pct_change_from_baseline',
+    'sex_encoded'
 ]
 # -------------------------
 
@@ -139,6 +199,7 @@ st.markdown("---")
 
 if model_loaded:
     # Check if all required features are present
+    # This check will now pass
     missing_features = [f for f in MODEL_FEATURES if f not in full_data.columns]
     if missing_features:
         st.error(f"Error: The data is missing the following required features for the model: {missing_features}")
@@ -154,6 +215,8 @@ if model_loaded:
     latest_treatments = full_data.groupby('patient_id').tail(1).copy()
 
     # Get predictions for all patients
+    # 'sex_encoded' is now in full_data, so this line is no longer needed
+    # latest_treatments['sex_encoded'] = (latest_treatments['sex'] == 'F').astype(int)
     X_predict = latest_treatments[MODEL_FEATURES]
     pred_probabilities = model.predict_proba(X_predict)[:, 1]  # Get prob of 'failure' (class 1)
 
@@ -204,10 +267,20 @@ if model_loaded:
                     return "Multiple Factors"
 
 
-            display_table = high_risk_patients[['patient_id', 'risk_score', 'age',
-                                                'access_blood_flow_qa', 'svpr', 'diabetes']].copy()
-            display_table['top_risk_factor'] = high_risk_patients.apply(get_top_risk_factor, axis=1)
+            # Create the display table from the already-calculated latest_treatments
+            display_table = latest_treatments[latest_treatments['risk_score'] > 70].copy()
+            display_table['top_risk_factor'] = display_table.apply(get_top_risk_factor, axis=1)
             display_table['risk_score'] = display_table['risk_score'].round(1)
+
+            # Rename columns for display
+            display_table = display_table.rename(columns={
+                'patient_id': 'Patient ID',
+                'risk_score': 'Risk Score (%)',
+                'age': 'Age',
+                'access_blood_flow_qa': 'Current Qa (mL/min)',
+                'svpr': 'Current SVPR',
+                'top_risk_factor': 'Top Risk Factor'
+            })
 
             # Reorder for clarity
             display_table = display_table[
@@ -256,25 +329,25 @@ if model_loaded:
     elif page == "Patient Detail":
         st.header("👤 Individual Patient Analysis")
 
+        # Patient selector
         patient_list = sorted(patients['patient_id'].unique())
         selected_patient = st.selectbox("Select Patient ID", patient_list)
 
         # Get patient data
+        # --- FIX: Use the full_data df which has all engineered features ---
         patient_info = patients[patients['patient_id'] == selected_patient].iloc[0]
-        patient_treatments = treatments[treatments['patient_id'] == selected_patient].sort_values('treatment_number')
+        # Use full_data, not the raw 'treatments' df
+        patient_treatments = full_data[full_data['patient_id'] == selected_patient].sort_values('treatment_number')
         patient_outcome = outcomes[outcomes['patient_id'] == selected_patient].iloc[0]
+
+        # Get the latest treatment row *from the engineered dataframe*
         latest = patient_treatments.iloc[-1]
 
-        # --- NEW RISK CALCULATION (for Patient Detail) ---
+        # --- 5. NEW RISK CALCULATION (for Patient Detail) ---
 
+        # --- FIX: This is much simpler now. We just create the DataFrame from the 'latest' row. ---
         # Create a single-row DataFrame for prediction
-        X_patient = pd.DataFrame({
-            'baseline_risk_score': [patient_info['baseline_risk_score']],
-            'access_blood_flow_qa': [latest['access_blood_flow_qa']],
-            'svpr': [latest['svpr']],
-            'access_recirculation_pct': [latest['access_recirculation_pct']],
-            'total_alarms': [latest['high_vp_alarms'] + latest['low_ap_alarms']]
-        }, index=[0])
+        X_patient = pd.DataFrame([latest], index=[0])
 
         # Re-order columns to match model's expected input
         X_patient = X_patient[MODEL_FEATURES]
@@ -390,8 +463,8 @@ if model_loaded:
         with col3:
             st.metric("Kt/V", f"{latest['ktv']:.2f}")
         with col4:
-            total_alarms = latest['high_vp_alarms'] + latest['low_ap_alarms']
-            st.metric("Alarms (Last Treatment)", int(total_alarms))
+            # 'total_alarms' is now available in the 'latest' row
+            st.metric("Alarms (Last Treatment)", int(latest['total_alarms']))
 
         # Outcome status
         if patient_outcome['failed'] == 1:
@@ -480,3 +553,4 @@ st.markdown("""
     <p>⚠️ For demonstration purposes only. Not for clinical use.</p>
 </div>
 """, unsafe_allow_html=True)
+
